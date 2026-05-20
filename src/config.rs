@@ -34,6 +34,7 @@ pub struct Config {
     pub archive_scan_min_age_days: Option<i64>, // Minimum archive age in days for manual move suggestions
     pub archive_scan_limit: Option<usize>,      // Maximum archive candidates to include in email
     pub archive_scan_require_supplement_pair: Option<bool>, // Require DDMMYYYY + DDMMYYYY.suppliment pair
+    pub archive_scan_timeout_seconds: Option<u64>,          // Max time budget for archive scan
 }
 
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config, String> {
@@ -278,6 +279,12 @@ fn validate_config(config: &Config) -> Result<(), String> {
         if let Some(limit) = config.archive_scan_limit {
             if limit == 0 {
                 missing_keys.push("archive_scan_limit (must be greater than 0)");
+            }
+        }
+
+        if let Some(timeout) = config.archive_scan_timeout_seconds {
+            if timeout == 0 {
+                missing_keys.push("archive_scan_timeout_seconds (must be greater than 0)");
             }
         }
     }

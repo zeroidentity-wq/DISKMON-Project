@@ -20,3 +20,4 @@ archive_scan_path: /opt/arcsight/archives  # Local path where ArcSight archives 
 archive_scan_min_age_days: 7  # Show archives older than this number of days
 archive_scan_limit: 5  # Maximum archive candidates shown in email
 archive_scan_require_supplement_pair: true  # Show only DDMMYYYY + DDMMYYYY.suppliment pairs
+archive_scan_timeout_seconds: 20  # Stop scan after this many seconds to avoid blocking periodic runs

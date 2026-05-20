@@ -11,7 +11,7 @@ use log::{debug, error, warn};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod config;
 mod system;
@@ -852,7 +852,14 @@ fn parse_archive_date(name: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(name, "%d%m%Y").ok()
 }
 
-fn directory_size(path: &Path) -> Result<u64, String> {
+fn directory_size(path: &Path, deadline: Instant) -> Result<u64, String> {
+    if Instant::now() >= deadline {
+        return Err(format!(
+            "Scanarea arhivelor a depasit bugetul de timp la {}",
+            path.display()
+        ));
+    }
+
     let metadata = fs::symlink_metadata(path).map_err(|e| {
         format!(
             "Nu s-a putut citi metadata pentru {}: {}",
@@ -875,7 +882,7 @@ fn directory_size(path: &Path) -> Result<u64, String> {
     for entry in entries {
         let entry = entry
             .map_err(|e| format!("Nu s-a putut citi o intrare din {}: {}", path.display(), e))?;
-        total = total.saturating_add(directory_size(&entry.path())?);
+        total = total.saturating_add(directory_size(&entry.path(), deadline)?);
     }
 
     Ok(total)
@@ -898,6 +905,8 @@ fn collect_archive_candidates(cfg: &config::Config, debug_enabled: bool) -> Vec<
     let min_age_days = cfg.archive_scan_min_age_days.unwrap_or(7);
     let limit = cfg.archive_scan_limit.unwrap_or(5);
     let require_pair = cfg.archive_scan_require_supplement_pair.unwrap_or(true);
+    let timeout_seconds = cfg.archive_scan_timeout_seconds.unwrap_or(20);
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     let today = Local::now().date_naive();
     let entries = match fs::read_dir(root_path) {
         Ok(entries) => entries,
@@ -934,7 +943,13 @@ fn collect_archive_candidates(cfg: &config::Config, debug_enabled: bool) -> Vec<
     }
 
     let mut candidates = Vec::new();
+    let mut timed_out = false;
     for (name, path) in &date_dirs {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+
         let Some(archive_date) = parse_archive_date(name) else {
             continue;
         };
@@ -956,9 +971,12 @@ fn collect_archive_candidates(cfg: &config::Config, debug_enabled: bool) -> Vec<
         let mut size_bytes = 0_u64;
         let mut size_failed = false;
         for candidate_path in &paths {
-            match directory_size(candidate_path) {
+            match directory_size(candidate_path, deadline) {
                 Ok(size) => size_bytes = size_bytes.saturating_add(size),
                 Err(e) => {
+                    if e.contains("depasit bugetul de timp") {
+                        timed_out = true;
+                    }
                     size_failed = true;
                     if debug_enabled {
                         debug!("{}", e);
@@ -969,6 +987,9 @@ fn collect_archive_candidates(cfg: &config::Config, debug_enabled: bool) -> Vec<
             }
         }
         if size_failed {
+            if timed_out {
+                break;
+            }
             continue;
         }
 
@@ -991,6 +1012,12 @@ fn collect_archive_candidates(cfg: &config::Config, debug_enabled: bool) -> Vec<
 
     candidates.sort_by(|left, right| right.size_bytes.cmp(&left.size_bytes));
     candidates.truncate(limit);
+    if timed_out {
+        warn!(
+            "Scanarea arhivelor s-a oprit la timeout ({}s). Rezultatele pot fi partiale.",
+            timeout_seconds
+        );
+    }
     candidates
 }
 
@@ -1794,7 +1821,6 @@ async fn main() {
     let problem_disks = alert_disks(&disks, thresholds);
     let current_state = load_alert_state(debug_enabled);
     let trends = calculate_trends(&current_state, &disks, now);
-    let archive_candidates = collect_archive_candidates(&cfg, debug_enabled);
     println!(
         "{} {} mount point-uri. Praguri: WARNING {:.2}% / CRITICAL {:.2}% / EMERGENCY {:.2}% ocupat.",
         "Monitorizare:".blue().bold(),
@@ -1830,14 +1856,6 @@ async fn main() {
             bytes_to_gb(disk.total_space)
         );
     }
-    if !archive_candidates.is_empty() {
-        println!(
-            "{} {} arhive vechi candidate pentru mutare manuala.",
-            "Arhive:".blue().bold(),
-            archive_candidates.len().to_string().green()
-        );
-    }
-
     if cli.json {
         #[derive(serde::Serialize)]
         struct JsonOutput {
@@ -1863,6 +1881,14 @@ async fn main() {
                 )
             })
             .collect();
+        let archive_candidates = collect_archive_candidates(&cfg, debug_enabled);
+        if !archive_candidates.is_empty() {
+            println!(
+                "{} {} arhive vechi candidate pentru mutare manuala.",
+                "Arhive:".blue().bold(),
+                archive_candidates.len().to_string().green()
+            );
+        }
         let output = JsonOutput {
             system_info,
             disks,
@@ -1896,6 +1922,14 @@ async fn main() {
                 .yellow()
                 .bold()
         );
+        let archive_candidates = collect_archive_candidates(&cfg, debug_enabled);
+        if !archive_candidates.is_empty() {
+            println!(
+                "{} {} arhive vechi candidate pentru mutare manuala.",
+                "Arhive:".blue().bold(),
+                archive_candidates.len().to_string().green()
+            );
+        }
         if let Err(e) = send_system_report(
             &cfg,
             &disks,
@@ -1962,6 +1996,14 @@ async fn main() {
                         .severity
                         .map(|severity| format!(" ({})", severity_label(severity)))
                         .unwrap_or_default()
+                );
+            }
+            let archive_candidates = collect_archive_candidates(&cfg, debug_enabled);
+            if !archive_candidates.is_empty() {
+                println!(
+                    "{} {} arhive vechi candidate pentru mutare manuala.",
+                    "Arhive:".blue().bold(),
+                    archive_candidates.len().to_string().green()
                 );
             }
             if let Err(e) = send_system_report(
@@ -2044,6 +2086,7 @@ mod tests {
             archive_scan_min_age_days: Some(7),
             archive_scan_limit: Some(5),
             archive_scan_require_supplement_pair: Some(true),
+            archive_scan_timeout_seconds: Some(20),
         }
     }
 
