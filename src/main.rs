@@ -1,5 +1,5 @@
 use backoff::{ExponentialBackoff, backoff::Backoff};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use clap::Parser;
 use colored::*;
 use lettre::{
@@ -10,6 +10,7 @@ use lettre::{
 use log::{debug, error, warn};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod config;
@@ -124,6 +125,16 @@ struct TrendInfo {
     growth_30d: Option<i64>,
     time_to_full_seconds: Option<i64>,
     abnormal_growth: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ArchiveCandidate {
+    name: String,
+    paths: Vec<String>,
+    size_bytes: u64,
+    age_days: i64,
+    archive_date: Option<String>,
+    has_supplement_pair: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -833,6 +844,197 @@ fn executive_table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
     )
 }
 
+fn parse_archive_date(name: &str) -> Option<NaiveDate> {
+    if name.len() != 8 || !name.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    NaiveDate::parse_from_str(name, "%d%m%Y").ok()
+}
+
+fn directory_size(path: &Path) -> Result<u64, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "Nu s-a putut citi metadata pentru {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0_u64;
+    let entries = fs::read_dir(path)
+        .map_err(|e| format!("Nu s-a putut citi directorul {}: {}", path.display(), e))?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("Nu s-a putut citi o intrare din {}: {}", path.display(), e))?;
+        total = total.saturating_add(directory_size(&entry.path())?);
+    }
+
+    Ok(total)
+}
+
+fn collect_archive_candidates(cfg: &config::Config, debug_enabled: bool) -> Vec<ArchiveCandidate> {
+    if !cfg.archive_scan_enabled.unwrap_or(false) {
+        return Vec::new();
+    }
+
+    let Some(root) = cfg.archive_scan_path.as_deref() else {
+        return Vec::new();
+    };
+    let root = root.trim();
+    if root.is_empty() {
+        return Vec::new();
+    }
+
+    let root_path = Path::new(root);
+    let min_age_days = cfg.archive_scan_min_age_days.unwrap_or(7);
+    let limit = cfg.archive_scan_limit.unwrap_or(5);
+    let require_pair = cfg.archive_scan_require_supplement_pair.unwrap_or(true);
+    let today = Local::now().date_naive();
+    let entries = match fs::read_dir(root_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(
+                "Nu s-a putut scana directorul de arhive {}: {}",
+                root_path.display(),
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut date_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut supplement_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if let Some(base) = name.strip_suffix(".suppliment") {
+            if parse_archive_date(base).is_some() {
+                supplement_dirs.insert(base.to_string(), path);
+            }
+        } else if parse_archive_date(name).is_some() {
+            date_dirs.insert(name.to_string(), path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (name, path) in &date_dirs {
+        let Some(archive_date) = parse_archive_date(name) else {
+            continue;
+        };
+        let age_days = today.signed_duration_since(archive_date).num_days();
+        if age_days < min_age_days {
+            continue;
+        }
+
+        let supplement_path = supplement_dirs.get(name);
+        if require_pair && supplement_path.is_none() {
+            continue;
+        }
+
+        let mut paths = vec![path.clone()];
+        if let Some(supplement_path) = supplement_path {
+            paths.push(supplement_path.clone());
+        }
+
+        let mut size_bytes = 0_u64;
+        let mut size_failed = false;
+        for candidate_path in &paths {
+            match directory_size(candidate_path) {
+                Ok(size) => size_bytes = size_bytes.saturating_add(size),
+                Err(e) => {
+                    size_failed = true;
+                    if debug_enabled {
+                        debug!("{}", e);
+                    } else {
+                        warn!("{}", e);
+                    }
+                }
+            }
+        }
+        if size_failed {
+            continue;
+        }
+
+        candidates.push(ArchiveCandidate {
+            name: if supplement_path.is_some() {
+                format!("{} + {}.suppliment", name, name)
+            } else {
+                name.clone()
+            },
+            paths: paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            size_bytes,
+            age_days,
+            archive_date: Some(archive_date.format("%d-%m-%Y").to_string()),
+            has_supplement_pair: supplement_path.is_some(),
+        });
+    }
+
+    candidates.sort_by(|left, right| right.size_bytes.cmp(&left.size_bytes));
+    candidates.truncate(limit);
+    candidates
+}
+
+fn build_archive_candidates_section(candidates: &[ArchiveCandidate]) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+
+    let rows = candidates
+        .iter()
+        .map(|candidate| {
+            vec![
+                escape_html(&candidate.name),
+                format!("{:.2} GB", bytes_to_gb(candidate.size_bytes)),
+                candidate.age_days.to_string(),
+                candidate
+                    .archive_date
+                    .as_deref()
+                    .map(escape_html)
+                    .unwrap_or_else(|| "N/A".to_string()),
+                escape_html(&candidate.paths.join(", ")),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    format!(
+        r#"<div class="archives">
+        <h2>Arhive vechi candidate pentru mutare manuala</h2>
+        <p>Aplicatia doar raporteaza aceste directoare. Nu copiaza, nu muta si nu sterge fisiere.</p>
+        {}
+      </div>"#,
+        executive_table(
+            &[
+                "Arhiva",
+                "Spatiu ocupat",
+                "Vechime zile",
+                "Data",
+                "Path local"
+            ],
+            rows
+        )
+    )
+}
+
 fn build_executive_summary(
     disks: &[DiskInfo],
     thresholds: AlertThresholds,
@@ -849,106 +1051,57 @@ fn build_executive_summary(
             .partial_cmp(&left.used_percent)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let top_occupied_rows = top_occupied
+    let watch_rows = top_occupied
         .into_iter()
         .take(5)
         .map(|disk| {
             let severity = severity_for_percent(disk.used_percent, thresholds);
+            let trend = trends.get(&mount_key(disk));
             vec![
                 escape_html(&disk.mount_point),
                 format!("{:.2}%", disk.used_percent),
                 format!("{:.2} GB", bytes_to_gb(disk.available_space)),
+                trend
+                    .map(|trend| format_growth(trend.growth_24h))
+                    .unwrap_or_else(|| "N/A".to_string()),
+                trend
+                    .map(|trend| format_growth(trend.growth_7d))
+                    .unwrap_or_else(|| "N/A".to_string()),
+                trend
+                    .map(|trend| format_time_to_full(trend.time_to_full_seconds))
+                    .unwrap_or_else(|| "N/A".to_string()),
                 severity_html(severity),
             ]
         })
         .collect::<Vec<_>>();
 
-    let mut top_growth = disks
+    let top_growth_24h = disks
         .iter()
         .filter_map(|disk| {
             trends
                 .get(&mount_key(disk))
-                .and_then(|trend| trend.growth_24h.map(|growth| (disk, trend, growth)))
+                .and_then(|trend| trend.growth_24h)
+                .filter(|growth| *growth > 0)
+                .map(|growth| (disk, growth))
         })
-        .filter(|(_, _, growth)| *growth > 0)
-        .collect::<Vec<_>>();
-    top_growth.sort_by(|(_, _, left), (_, _, right)| right.cmp(left));
-    let top_growth_rows = top_growth
-        .into_iter()
-        .take(5)
-        .map(|(disk, trend, growth)| {
-            vec![
-                escape_html(&disk.mount_point),
-                format_growth(Some(growth)),
-                format_growth(trend.growth_7d),
-                if trend.abnormal_growth {
-                    "Da".to_string()
-                } else {
-                    "Nu".to_string()
-                },
-            ]
-        })
-        .collect::<Vec<_>>();
+        .max_by_key(|(_, growth)| *growth);
+    let (top_growth_24h_value, top_growth_24h_mount) = top_growth_24h
+        .map(|(disk, growth)| (format_growth(Some(growth)), escape_html(&disk.mount_point)))
+        .unwrap_or_else(|| ("N/A".to_string(), "Nu exista date".to_string()));
 
-    let mut time_to_full = disks
+    let top_growth_7d = disks
         .iter()
         .filter_map(|disk| {
             trends
                 .get(&mount_key(disk))
-                .and_then(|trend| trend.time_to_full_seconds.map(|seconds| (disk, seconds)))
+                .and_then(|trend| trend.growth_7d)
+                .filter(|growth| *growth > 0)
+                .map(|growth| (disk, growth))
         })
-        .collect::<Vec<_>>();
-    time_to_full.sort_by_key(|(_, seconds)| *seconds);
-    let time_to_full_rows = time_to_full
-        .into_iter()
-        .take(5)
-        .map(|(disk, seconds)| {
-            vec![
-                escape_html(&disk.mount_point),
-                format_time_to_full(Some(seconds)),
-                format!("{:.2} GB", bytes_to_gb(disk.available_space)),
-                severity_html(severity_for_percent(disk.used_percent, thresholds)),
-            ]
-        })
-        .collect::<Vec<_>>();
-
-    let mut recommendations = Vec::new();
-    if emergency_count > 0 {
-        recommendations.push("Interventie imediata pe mount point-urile EMERGENCY: curatare, extindere volum sau mutare date.".to_string());
-    }
-    if critical_count > 0 {
-        recommendations
-            .push("Plan de remediere in aceeasi zi pentru mount point-urile CRITICAL.".to_string());
-    }
-    if warning_count > 0 {
-        recommendations
-            .push("Urmarire si verificare cauze pentru mount point-urile WARNING.".to_string());
-    }
-    if trends.values().any(|trend| trend.abnormal_growth) {
-        recommendations.push(
-            "Investigati procesele/logurile care au produs crestere anormala in ultimele 24h."
-                .to_string(),
-        );
-    }
-    if disks.iter().any(|disk| {
-        trends
-            .get(&mount_key(disk))
-            .and_then(|trend| trend.time_to_full_seconds)
-            .map(|seconds| seconds <= 7 * 86_400)
-            .unwrap_or(false)
-    }) {
-        recommendations
-            .push("Prioritizati mount point-urile cu estimare de umplere sub 7 zile.".to_string());
-    }
-    if recommendations.is_empty() {
-        recommendations
-            .push("Nu sunt actiuni urgente; continuati monitorizarea zilnica.".to_string());
-    }
-    let recommendations = recommendations
-        .into_iter()
-        .map(|item| format!("<li>{}</li>", escape_html(&item)))
-        .collect::<Vec<_>>()
-        .join("");
+        .max_by_key(|(_, growth)| *growth);
+    let (top_growth_7d_value, top_growth_7d_mount) = top_growth_7d
+        .map(|(disk, growth)| (format_growth(Some(growth)), escape_html(&disk.mount_point)))
+        .unwrap_or_else(|| ("N/A".to_string(), "Nu exista date".to_string()));
 
     format!(
         r#"<div class="executive">
@@ -960,33 +1113,34 @@ fn build_executive_summary(
           <div><span>CRITICAL</span><strong>{critical_count}</strong></div>
           <div><span>EMERGENCY</span><strong>{emergency_count}</strong></div>
         </div>
-        <h3>Top 5 cele mai ocupate mount point-uri</h3>
-        {top_occupied}
-        <h3>Top 5 cele mai mari cresteri fata de ziua precedenta</h3>
-        {top_growth}
-        <h3>Estimari time-to-full</h3>
-        {time_to_full}
-        <h3>Recomandari de actiune</h3>
-        <ul class="recommendations">{recommendations}</ul>
+        <div class="trend-kpis">
+          <div><span>Cea mai mare crestere 24h</span><strong>{top_growth_24h_value}</strong><em>{top_growth_24h_mount}</em></div>
+          <div><span>Cea mai mare crestere 7 zile</span><strong>{top_growth_7d_value}</strong><em>{top_growth_7d_mount}</em></div>
+        </div>
+        <h3>Mount point-uri de urmarit</h3>
+        {watch_table}
       </div>"#,
         status = escape_html(status),
         ok_count = ok_count,
         warning_count = warning_count,
         critical_count = critical_count,
         emergency_count = emergency_count,
-        top_occupied = executive_table(
-            &["Mount point", "Ocupare", "Disponibil", "Severitate"],
-            top_occupied_rows
-        ),
-        top_growth = executive_table(
-            &["Mount point", "Crestere 24h", "Crestere 7 zile", "Anormal"],
-            top_growth_rows
-        ),
-        time_to_full = executive_table(
-            &["Mount point", "Estimare", "Disponibil", "Severitate"],
-            time_to_full_rows
-        ),
-        recommendations = recommendations
+        top_growth_24h_value = top_growth_24h_value,
+        top_growth_24h_mount = top_growth_24h_mount,
+        top_growth_7d_value = top_growth_7d_value,
+        top_growth_7d_mount = top_growth_7d_mount,
+        watch_table = executive_table(
+            &[
+                "Mount point",
+                "Ocupare",
+                "Disponibil",
+                "Crestere 24h",
+                "Crestere 7 zile",
+                "Estimare umplere",
+                "Severitate"
+            ],
+            watch_rows
+        )
     )
 }
 
@@ -1125,6 +1279,7 @@ fn build_email_body(
     recovery_threshold: f64,
     events: &[AlertEvent],
     trends: &BTreeMap<String, TrendInfo>,
+    archive_candidates: &[ArchiveCandidate],
 ) -> String {
     let display_name = cfg
         .friendly_name
@@ -1204,6 +1359,12 @@ fn build_email_body(
         build_executive_summary(disks, thresholds, trends)
     } else {
         String::new()
+    };
+    let archive_candidates_section = build_archive_candidates_section(archive_candidates);
+    let trend_summary_row = if report_kind == ReportKind::Forced {
+        String::new()
+    } else {
+        format!("<tr><td>Trend</td><td>{}</td></tr>", trend_summary)
     };
 
     let mut rows = String::new();
@@ -1297,11 +1458,17 @@ fn build_email_body(
     .kpis div {{ border:1px solid #e5e7eb; border-radius:6px; padding:10px; background:#f8fafc; }}
     .kpis span {{ display:block; color:#667085; font-size:11px; font-weight:700; }}
     .kpis strong {{ display:block; margin-top:4px; font-size:18px; }}
+    .trend-kpis {{ display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-top:8px; }}
+    .trend-kpis div {{ border:1px solid #e5e7eb; border-radius:6px; padding:10px; background:#fff7ed; }}
+    .trend-kpis span {{ display:block; color:#667085; font-size:11px; font-weight:700; }}
+    .trend-kpis strong {{ display:block; margin-top:4px; font-size:18px; color:#9a3412; }}
+    .trend-kpis em {{ display:block; margin-top:3px; color:#475467; font-size:11px; font-style:normal; }}
+    .archives {{ padding:18px 24px; border-bottom:1px solid #e5e7eb; }}
+    .archives h2 {{ margin:0 0 8px; font-size:16px; }}
+    .archives p {{ margin:0 0 10px; color:#667085; font-size:12px; line-height:1.4; }}
     table.mini {{ width:100%; border-collapse:collapse; font-size:12px; }}
     table.mini th {{ background:#f8fafc; color:#344054; text-align:left; padding:8px; border-bottom:1px solid #e5e7eb; }}
     table.mini td {{ padding:8px; border-bottom:1px solid #edf2f7; }}
-    .recommendations {{ margin:0; padding-left:16px; color:#475467; font-size:12px; line-height:1.4; }}
-    .recommendations li {{ margin:3px 0; font-weight:400; }}
     .empty {{ margin:0; color:#667085; font-size:12px; }}
     .summary {{ padding:18px 24px; border-bottom:1px solid #e5e7eb; }}
     .status {{ display:inline-block; padding:6px 10px; border-radius:6px; background:{status_color}; color:#ffffff; font-weight:700; font-size:12px; letter-spacing:.3px; }}
@@ -1331,9 +1498,9 @@ fn build_email_body(
       <div class="header">
         <h1>Raport spatiu de stocare</h1>
         <p>{display_name} ({hostname})</p>
-      </div>
-      {executive_summary}
-      <div class="summary">
+	      </div>
+	      {executive_summary}
+	      <div class="summary">
         <span class="status">{status_label}</span>
         <table class="meta">
           <tr><td>Sistem</td><td>{os_info}</td></tr>
@@ -1345,7 +1512,7 @@ fn build_email_body(
           <tr><td>Mount point-uri monitorizate</td><td>{disk_count}</td></tr>
           <tr><td>Mount point-uri peste prag</td><td>{problem_count}</td></tr>
           <tr><td>Evenimente</td><td>{event_summary}</td></tr>
-          <tr><td>Trend</td><td>{trend_summary}</td></tr>
+          {trend_summary_row}
         </table>
       </div>
       <table class="disks">
@@ -1366,9 +1533,10 @@ fn build_email_body(
             <th>Status</th>
           </tr>
         </thead>
-        <tbody>{rows}</tbody>
-      </table>
-      <div class="footer">Raport generat automat de diskmon-mail.</div>
+	        <tbody>{rows}</tbody>
+	      </table>
+	      {archive_candidates_section}
+	      <div class="footer">Raport generat automat de diskmon-mail.</div>
     </div>
   </div>
 </body>
@@ -1390,8 +1558,9 @@ fn build_email_body(
         disk_count = disks.len(),
         problem_count = problem_count,
         event_summary = event_summary,
-        trend_summary = trend_summary,
+        trend_summary_row = trend_summary_row,
         executive_summary = executive_summary,
+        archive_candidates_section = archive_candidates_section,
         status_label = status_label,
         status_color = status_color,
         rows = rows
@@ -1405,6 +1574,7 @@ async fn send_system_report(
     report_kind: ReportKind,
     events: &[AlertEvent],
     trends: &BTreeMap<String, TrendInfo>,
+    archive_candidates: &[ArchiveCandidate],
     debug_enabled: bool,
 ) -> Result<(), String> {
     if !cfg.mail_enabled {
@@ -1454,6 +1624,7 @@ async fn send_system_report(
         recovery_threshold,
         events,
         trends,
+        archive_candidates,
     );
 
     let mut builder = Message::builder().from(
@@ -1623,6 +1794,7 @@ async fn main() {
     let problem_disks = alert_disks(&disks, thresholds);
     let current_state = load_alert_state(debug_enabled);
     let trends = calculate_trends(&current_state, &disks, now);
+    let archive_candidates = collect_archive_candidates(&cfg, debug_enabled);
     println!(
         "{} {} mount point-uri. Praguri: WARNING {:.2}% / CRITICAL {:.2}% / EMERGENCY {:.2}% ocupat.",
         "Monitorizare:".blue().bold(),
@@ -1658,6 +1830,13 @@ async fn main() {
             bytes_to_gb(disk.total_space)
         );
     }
+    if !archive_candidates.is_empty() {
+        println!(
+            "{} {} arhive vechi candidate pentru mutare manuala.",
+            "Arhive:".blue().bold(),
+            archive_candidates.len().to_string().green()
+        );
+    }
 
     if cli.json {
         #[derive(serde::Serialize)]
@@ -1667,6 +1846,7 @@ async fn main() {
             thresholds: AlertThresholds,
             threshold_meaning: &'static str,
             trends: BTreeMap<String, TrendInfo>,
+            archive_candidates: Vec<ArchiveCandidate>,
             alerts: Vec<String>,
         }
 
@@ -1689,6 +1869,7 @@ async fn main() {
             thresholds,
             threshold_meaning: "procent ocupat",
             trends,
+            archive_candidates,
             alerts,
         };
         match serde_json::to_string_pretty(&output) {
@@ -1722,6 +1903,7 @@ async fn main() {
             ReportKind::Forced,
             &[],
             &trends,
+            &archive_candidates,
             debug_enabled,
         )
         .await
@@ -1789,6 +1971,7 @@ async fn main() {
                 report_kind,
                 &decision.events,
                 &trends,
+                &archive_candidates,
                 debug_enabled,
             )
             .await
@@ -1856,6 +2039,11 @@ mod tests {
             debug: Some(false),
             friendly_name: Some("test".to_string()),
             excluded_disks: Some(vec![]),
+            archive_scan_enabled: Some(false),
+            archive_scan_path: None,
+            archive_scan_min_age_days: Some(7),
+            archive_scan_limit: Some(5),
+            archive_scan_require_supplement_pair: Some(true),
         }
     }
 
@@ -1883,6 +2071,10 @@ mod tests {
             used_percent: percent(used_space, total_space),
             free_percent: percent(total_space.saturating_sub(used_space), total_space),
         }
+    }
+
+    fn write_test_file(path: &Path, bytes: usize) {
+        fs::write(path, vec![b'x'; bytes]).unwrap();
     }
 
     #[test]
@@ -2005,6 +2197,70 @@ mod tests {
     }
 
     #[test]
+    fn archive_scan_reports_old_largest_pairs_only() {
+        let root =
+            std::env::temp_dir().join(format!("diskmon-archive-scan-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let old_large = (Local::now().date_naive() - chrono::Duration::days(10))
+            .format("%d%m%Y")
+            .to_string();
+        let old_small = (Local::now().date_naive() - chrono::Duration::days(9))
+            .format("%d%m%Y")
+            .to_string();
+        let recent = (Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%d%m%Y")
+            .to_string();
+
+        for name in [
+            old_large.as_str(),
+            &format!("{}.suppliment", old_large),
+            old_small.as_str(),
+            &format!("{}.suppliment", old_small),
+            recent.as_str(),
+            &format!("{}.suppliment", recent),
+        ] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        write_test_file(&root.join(&old_large).join("a.log"), 100);
+        write_test_file(
+            &root.join(format!("{}.suppliment", old_large)).join("b.log"),
+            100,
+        );
+        write_test_file(&root.join(&old_small).join("a.log"), 10);
+        write_test_file(
+            &root.join(format!("{}.suppliment", old_small)).join("b.log"),
+            10,
+        );
+        write_test_file(&root.join(&recent).join("a.log"), 1);
+        write_test_file(
+            &root.join(format!("{}.suppliment", recent)).join("b.log"),
+            1,
+        );
+
+        let mut cfg = test_config();
+        cfg.archive_scan_enabled = Some(true);
+        cfg.archive_scan_path = Some(root.display().to_string());
+        cfg.archive_scan_min_age_days = Some(7);
+        cfg.archive_scan_limit = Some(2);
+        cfg.archive_scan_require_supplement_pair = Some(true);
+
+        let candidates = collect_archive_candidates(&cfg, false);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].name.contains(&old_large));
+        assert!(candidates[0].size_bytes > candidates[1].size_bytes);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.has_supplement_pair)
+        );
+        assert!(candidates.iter().all(|candidate| candidate.age_days >= 7));
+    }
+
+    #[test]
     fn executive_summary_contains_daily_sections() {
         let cfg = test_config();
         let thresholds = alert_thresholds(&cfg);
@@ -2024,10 +2280,17 @@ mod tests {
         let html = build_executive_summary(&[disk], thresholds, &trends);
 
         assert!(html.contains("Sumar executiv"));
-        assert!(html.contains("Top 5 cele mai ocupate"));
-        assert!(html.contains("Top 5 cele mai mari cresteri"));
-        assert!(html.contains("Estimari time-to-full"));
-        assert!(html.contains("Recomandari de actiune"));
+        assert!(html.contains("Mount point-uri de urmarit"));
+        assert!(html.contains("Cea mai mare crestere 24h"));
+        assert!(html.contains("Cea mai mare crestere 7 zile"));
+        assert!(html.contains("Crestere 24h"));
+        assert!(html.contains("Crestere 7 zile"));
+        assert!(html.contains("Estimare umplere"));
+        assert!(!html.contains("Top 5"));
+        assert!(!html.contains("Top cele mai ocupate"));
+        assert!(!html.contains("Top cele mai mari cresteri"));
+        assert!(!html.contains("Estimari time-to-full"));
+        assert!(!html.contains("Recomandari de actiune"));
         assert!(html.contains("EMERGENCY"));
     }
 

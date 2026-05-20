@@ -29,6 +29,11 @@ pub struct Config {
     pub debug: Option<bool>,                     // Enable debug output
     pub friendly_name: Option<String>,           // New: single friendly name
     pub excluded_disks: Option<Vec<String>>, // List of disks to exclude (drive letters or device names)
+    pub archive_scan_enabled: Option<bool>,  // Include old archive candidates in email reports
+    pub archive_scan_path: Option<String>,   // Local ArcSight archive directory to scan
+    pub archive_scan_min_age_days: Option<i64>, // Minimum archive age in days for manual move suggestions
+    pub archive_scan_limit: Option<usize>,      // Maximum archive candidates to include in email
+    pub archive_scan_require_supplement_pair: Option<bool>, // Require DDMMYYYY + DDMMYYYY.suppliment pair
 }
 
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config, String> {
@@ -252,6 +257,27 @@ fn validate_config(config: &Config) -> Result<(), String> {
                         disk
                     ));
                 }
+            }
+        }
+    }
+
+    if config.archive_scan_enabled.unwrap_or(false) {
+        match config.archive_scan_path.as_deref() {
+            Some(path) if !path.trim().is_empty() => {}
+            _ => {
+                missing_keys.push("archive_scan_path (required when archive_scan_enabled is true)")
+            }
+        }
+
+        if let Some(days) = config.archive_scan_min_age_days {
+            if days < 0 {
+                missing_keys.push("archive_scan_min_age_days (must be 0 or greater)");
+            }
+        }
+
+        if let Some(limit) = config.archive_scan_limit {
+            if limit == 0 {
+                missing_keys.push("archive_scan_limit (must be greater than 0)");
             }
         }
     }

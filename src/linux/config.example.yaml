@@ -14,3 +14,9 @@ recovery_threshold_percent: 82.0  # Marcheaza revenirea cand ocuparea scade la a
 send_recovery_email: true  # Trimite email cand un mount point revine sub pragul de recovery
 excluded_disks: [""]  # List of disks to exclude (Linux: e.g. ["sda", "nvme0n1"]; Windows: e.g. ["C:", "D:"])
 friendly_name: "Example device"  # Optional: friendly name for this device in reports
+
+archive_scan_enabled: false  # Include old ArcSight archive candidates in email reports, read-only
+archive_scan_path: /opt/arcsight/archives  # Local path where ArcSight archives are created
+archive_scan_min_age_days: 7  # Show archives older than this number of days
+archive_scan_limit: 5  # Maximum archive candidates shown in email
+archive_scan_require_supplement_pair: true  # Show only DDMMYYYY + DDMMYYYY.suppliment pairs
