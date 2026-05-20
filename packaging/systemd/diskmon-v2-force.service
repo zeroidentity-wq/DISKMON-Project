@@ -1,0 +1,19 @@
+[Unit]
+Description=Diskmon v2 daily/on-demand storage report (one-shot)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=DISKMON_CONFIG_PATH=/etc/diskmon-v2/config.yaml
+Environment=DISKMON_STATE_PATH=/var/lib/diskmon-v2/diskmon-state.json
+WorkingDirectory=/var/lib/diskmon-v2
+ExecStart=/usr/bin/diskmon-mail-v2 --force-mail
+StandardOutput=journal
+StandardError=journal
+Nice=10
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

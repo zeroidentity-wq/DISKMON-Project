@@ -1,27 +1,25 @@
-sudo mkdir -p /etc/diskmon
-sudo cp /path/to/your/repo/config.yaml /etc/diskmon/config.yaml
-# sau dacă ai doar un exemplu:
-# sudo cp /path/to/your/repo/src/linux/config.example.yaml /etc/diskmon/config.yaml
+# Instalare manuala DiskMon v2 fara RPM.
+# Numele si caile sunt separate de instalarea veche diskmon/diskmon-mail.
+
+sudo mkdir -p /etc/diskmon-v2 /var/lib/diskmon-v2
+sudo cp target/x86_64-unknown-linux-musl/release/diskmon-mail-v2 /usr/bin/diskmon-mail-v2
+sudo cp src/linux/config.example.yaml /etc/diskmon-v2/config.yaml
+
+sudo cp packaging/systemd/diskmon-v2.service /etc/systemd/system/
+sudo cp packaging/systemd/diskmon-v2.timer /etc/systemd/system/
+sudo cp packaging/systemd/diskmon-v2-force.service /etc/systemd/system/
+sudo cp packaging/systemd/diskmon-v2-force.timer /etc/systemd/system/
+
+sudo chown root:root /etc/diskmon-v2/config.yaml
+sudo chmod 600 /etc/diskmon-v2/config.yaml
+sudo chmod 755 /var/lib/diskmon-v2
 
 sudo systemctl daemon-reload
-
-# Enable and start the normal 5-min timer
-sudo systemctl enable --now diskmon.timer
-
-# Enable and start the daily forced timer
-sudo systemctl enable --now diskmon-force.timer
+sudo systemctl enable --now diskmon-v2.timer
+sudo systemctl enable --now diskmon-v2-force.timer
 
 # Run once now (normal)
-sudo systemctl start diskmon.service
+sudo systemctl start diskmon-v2.service
 
-# Run forced once now
-sudo systemctl start diskmon-force.service
-
-# Restrânge permisiunile (recomandat)
-sudo chown root:root /etc/diskmon/config.yaml
-sudo chmod 600 /etc/diskmon/config.yaml
-
-sudo systemctl daemon-reload
-sudo systemctl restart diskmon.service
-# Dacă folosești timer:
-sudo systemctl restart diskmon.timer
+# Run daily/on-demand report once now
+sudo systemctl start diskmon-v2-force.service

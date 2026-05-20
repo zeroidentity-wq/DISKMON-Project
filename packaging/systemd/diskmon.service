@@ -1,5 +1,5 @@
 [Unit]
-Description=Diskmon periodic run (one-shot)
+Description=Diskmon periodic storage check (one-shot)
 After=network.target
 
 [Service]
@@ -7,8 +7,7 @@ Type=oneshot
 User=root
 Group=root
 WorkingDirectory=/etc/diskmon
-# Use wrapper to capture logs and rotate; change path if necessary
-ExecStart=/usr/local/bin/diskmon-run.sh
+ExecStart=/usr/local/bin/diskmon-mail/diskmon-mail
 StandardOutput=journal
 StandardError=journal
 Nice=10

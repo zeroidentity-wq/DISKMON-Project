@@ -1,5 +1,5 @@
 [Unit]
-Description=Diskmon forced run (one-shot) - sends --force-mail
+Description=Diskmon daily/on-demand storage report (one-shot)
 After=network.target
 
 [Service]
@@ -7,8 +7,7 @@ Type=oneshot
 User=root
 Group=root
 WorkingDirectory=/etc/diskmon
-# Pass --force-mail to the wrapper (or to the binary directly)
-ExecStart=/usr/local/bin/diskmon-mail/diskmon-mail_v6 --force-mail
+ExecStart=/usr/local/bin/diskmon-mail/diskmon-mail --force-mail
 StandardOutput=journal
 StandardError=journal
 Nice=10
